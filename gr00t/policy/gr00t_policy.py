@@ -20,6 +20,7 @@ This module provides the core policy classes for running Gr00t models:
 - Gr00tSimPolicyWrapper: Wrapper for compatibility with existing Gr00t simulation environments
 """
 
+import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -87,6 +88,7 @@ class Gr00tPolicy(BasePolicy):
         *,
         device: int | str,
         strict: bool = True,
+        cache_backbone: bool = False,
     ):
         """Initialize the Gr00t Policy.
 
@@ -96,6 +98,9 @@ class Gr00tPolicy(BasePolicy):
             model_path: Path to the pretrained model checkpoint directory
             device: Device to run the model on (e.g., 'cuda:0', 0, 'cpu')
             strict: Whether to enforce strict input validation (default: True)
+            cache_backbone: If True, cache backbone outputs and skip the backbone
+                forward pass when video frames are unchanged between calls. Useful
+                for control loops running faster than the camera frame rate.
         """
         # Import this to register all models.
         import gr00t.model  # noqa: F401
@@ -173,6 +178,11 @@ class Gr00tPolicy(BasePolicy):
         assert len(language_keys) >= 1, "At least one language key is required"
         assert len(language_delta_indices) == 1, "Only one language delta index is supported"
         self.language_key = language_keys[0]
+
+        # Backbone caching state
+        self.cache_backbone = cache_backbone
+        self._cached_backbone_outputs = None
+        self._cached_video_fingerprint: str | None = None
 
     def _unbatch_observation(self, value: dict[str, Any]) -> list[dict[str, Any]]:
         """Unbatch a batched observation into a list of single observations.
@@ -377,6 +387,22 @@ class Gr00tPolicy(BasePolicy):
                     f"Language batch item must be a string. Got {type(batch_item[0])}"
                 )
 
+    def _video_fingerprint(self, observation: dict[str, Any]) -> str:
+        """Compute a fast fingerprint of the video data in an observation.
+
+        Samples ~64 evenly-spaced bytes from each video array and hashes them.
+        This avoids hashing the full image (~400KB per frame) while still
+        catching frame changes reliably.
+        """
+        h = hashlib.sha256()
+        for key in sorted(observation["video"].keys()):
+            arr = observation["video"][key]
+            h.update(key.encode())
+            flat = arr.ravel()
+            stride = max(1, len(flat) // 64)
+            h.update(flat[::stride].tobytes())
+        return h.hexdigest()[:32]
+
     def _get_action(
         self, observation: dict[str, Any], options: dict[str, Any] | None = None
     ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -386,7 +412,7 @@ class Gr00tPolicy(BasePolicy):
         1. Unbatch observations into individual samples
         2. Convert each to VLAStepData and process
         3. Collate into model input batch
-        4. Run model inference
+        4. Run model inference (with optional backbone caching)
         5. Decode and unnormalize actions
 
         Args:
@@ -413,8 +439,26 @@ class Gr00tPolicy(BasePolicy):
         collated_inputs = _rec_to_dtype(collated_inputs, dtype=torch.bfloat16)
 
         # Step 4: Run model inference to predict actions
+        cache_hit = False
+        if self.cache_backbone:
+            fingerprint = self._video_fingerprint(observation)
+            cache_hit = (
+                self._cached_backbone_outputs is not None
+                and fingerprint == self._cached_video_fingerprint
+            )
+
         with torch.inference_mode():
-            model_pred = self.model.get_action(**collated_inputs)
+            if self.cache_backbone:
+                model_pred, backbone_outputs = self.model.get_action_cached(
+                    cached_backbone_outputs=self._cached_backbone_outputs if cache_hit else None,
+                    options=options,
+                    **collated_inputs,
+                )
+                self._cached_backbone_outputs = backbone_outputs
+                self._cached_video_fingerprint = fingerprint
+            else:
+                model_pred = self.model.get_action(**collated_inputs)
+
         normalized_action = model_pred["action_pred"].float()
 
         # Step 5: Decode actions from normalized space back to physical units
@@ -429,7 +473,8 @@ class Gr00tPolicy(BasePolicy):
         casted_action = {
             key: value.astype(np.float32) for key, value in unnormalized_action.items()
         }
-        return casted_action, {}
+        info = {"backbone_cache_hit": cache_hit} if self.cache_backbone else {}
+        return casted_action, info
 
     def check_action(self, action: dict[str, Any]) -> None:
         """Validate that the action has the correct structure and types.
@@ -482,12 +527,16 @@ class Gr00tPolicy(BasePolicy):
     def reset(self, options: dict[str, Any] | None = None) -> dict[str, Any]:
         """Reset the policy to its initial state.
 
+        Clears any cached backbone outputs so the next call runs the full pipeline.
+
         Args:
             options: Dictionary containing the options for the reset
 
         Returns:
             Dictionary containing the info after resetting the policy
         """
+        self._cached_backbone_outputs = None
+        self._cached_video_fingerprint = None
         return {}
 
 

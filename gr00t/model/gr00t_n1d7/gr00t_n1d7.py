@@ -613,6 +613,26 @@ class Gr00tN1d7(PreTrainedModel):
 
         return action_outputs
 
+    def get_action_cached(
+        self,
+        inputs: dict,
+        cached_backbone_outputs: BatchFeature | None = None,
+        options: dict[str, Any] | None = None,
+    ) -> tuple[BatchFeature, BatchFeature]:
+        """Generate actions, optionally reusing cached backbone outputs.
+
+        Returns both the action outputs and the backbone outputs (for caching).
+        """
+        backbone_inputs, action_inputs = self.prepare_input(inputs)
+
+        if cached_backbone_outputs is not None:
+            backbone_outputs = cached_backbone_outputs
+        else:
+            backbone_outputs = self.backbone(backbone_inputs)
+
+        action_outputs = self.action_head.get_action(backbone_outputs, action_inputs, options)
+        return action_outputs, backbone_outputs
+
     @property
     def device(self):
         return next(iter(self.parameters())).device
