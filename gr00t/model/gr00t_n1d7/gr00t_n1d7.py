@@ -176,8 +176,12 @@ class Gr00tN1d7ActionHead(nn.Module):
         backbone_features = backbone_output["backbone_features"]
         backbone_features = self.vlln(backbone_features)
         backbone_features = self.vl_self_attention(backbone_features)
-        backbone_output["backbone_features"] = backbone_features
-        return backbone_output
+        # Return a new BatchFeature rather than writing back into the caller's.
+        # Gr00tPolicy caches backbone outputs across control steps, and mutating
+        # them here would re-apply vlln/vl_self_attention on every cache hit.
+        return BatchFeature(
+            data={**dict(backbone_output), "backbone_features": backbone_features}
+        )
 
     def forward(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
         """
