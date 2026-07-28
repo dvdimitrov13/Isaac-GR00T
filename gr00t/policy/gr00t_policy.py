@@ -89,6 +89,7 @@ class Gr00tPolicy(BasePolicy):
         device: int | str,
         strict: bool = True,
         cache_backbone: bool = False,
+        cache_preprocessing: bool = False,
     ):
         """Initialize the Gr00t Policy.
 
@@ -101,6 +102,11 @@ class Gr00tPolicy(BasePolicy):
             cache_backbone: If True, cache backbone outputs and skip the backbone
                 forward pass when video frames are unchanged between calls. Useful
                 for control loops running faster than the camera frame rate.
+            cache_preprocessing: If True, additionally cache the VLM half of
+                preprocessing (image transforms, PIL conversion, chat template,
+                image processor and tokenizer) and reuse it while the video and
+                language are unchanged. Only ``state`` is recomputed, since it
+                changes every control step. Requires cache_backbone.
         """
         # Import this to register all models.
         import gr00t.model  # noqa: F401
@@ -183,6 +189,16 @@ class Gr00tPolicy(BasePolicy):
         self.cache_backbone = cache_backbone
         self._cached_backbone_outputs = None
         self._cached_video_fingerprint: str | None = None
+
+        # Preprocessing caching state
+        if cache_preprocessing and not cache_backbone:
+            raise ValueError(
+                "cache_preprocessing=True requires cache_backbone=True: the cached VLM "
+                "tensors are only valid while the backbone output is also being reused."
+            )
+        self.cache_preprocessing = cache_preprocessing
+        self._cached_collated_inputs: dict[str, Any] | None = None
+        self._cached_vlm_fingerprint: str | None = None
 
     def _unbatch_observation(self, value: dict[str, Any]) -> list[dict[str, Any]]:
         """Unbatch a batched observation into a list of single observations.
@@ -388,20 +404,68 @@ class Gr00tPolicy(BasePolicy):
                 )
 
     def _video_fingerprint(self, observation: dict[str, Any]) -> str:
-        """Compute a fast fingerprint of the video data in an observation.
+        """Compute a fingerprint of the video data in an observation.
 
-        Samples ~64 evenly-spaced bytes from each video array and hashes them.
-        This avoids hashing the full image (~400KB per frame) while still
-        catching frame changes reliably.
+        Hashes the full contents of each video array. Sampling a subset is
+        cheaper, but a collision silently serves stale vision features (and,
+        with cache_preprocessing, stale VLM tensors) for a frame that really
+        did change. Hashing ~700KB costs well under a millisecond against the
+        tens of milliseconds a cache hit saves, so exactness is the better
+        trade here.
         """
         h = hashlib.sha256()
         for key in sorted(observation["video"].keys()):
-            arr = observation["video"][key]
+            arr = np.ascontiguousarray(observation["video"][key])
             h.update(key.encode())
-            flat = arr.ravel()
-            stride = max(1, len(flat) // 64)
-            h.update(flat[::stride].tobytes())
+            h.update(str(arr.shape).encode())
+            h.update(str(arr.dtype).encode())
+            h.update(arr.tobytes())
         return h.hexdigest()[:32]
+
+    def _vlm_fingerprint(self, observation: dict[str, Any]) -> str:
+        """Fingerprint everything the cached VLM tensors depend on.
+
+        The VLM branch of preprocessing is a pure function of the video frames
+        and the language instruction, so both must be covered.
+        """
+        h = hashlib.sha256()
+        h.update(self._video_fingerprint(observation).encode())
+        for key in sorted(observation["language"].keys()):
+            for text in observation["language"][key]:
+                h.update(repr(text).encode())
+        return h.hexdigest()[:32]
+
+    def _normalized_state(self, states: list[dict[str, np.ndarray]]) -> torch.Tensor:
+        """Normalize and pad states into the batched `state` tensor.
+
+        Mirrors the state handling in Gr00tN1d7Processor.__call__ so the cached
+        preprocessing path produces a tensor identical to the full path. The
+        training-only state-dropout branch is intentionally omitted: this runs
+        at inference, where the processor is in eval mode.
+        """
+        proc = self.processor
+        tag = self.embodiment_tag.value
+        state_config = proc.modality_configs[tag]["state"]
+        state_keys = state_config.modality_keys
+        exclude_state = proc.exclude_state or getattr(state_config, "exclude_state", False)
+
+        batched = []
+        for state_data in states:
+            if exclude_state:
+                normalized = torch.cat(
+                    [torch.from_numpy(np.zeros_like(state_data[k])) for k in state_keys], dim=-1
+                )
+            else:
+                norm_state_dict = proc.state_action_processor.apply_state(
+                    state=state_data, embodiment_tag=tag
+                )
+                normalized = torch.cat(
+                    [torch.from_numpy(norm_state_dict[k]) for k in state_keys], dim=-1
+                )
+            padding = torch.zeros(normalized.shape[0], proc.max_state_dim - normalized.shape[1])
+            batched.append(torch.cat([normalized, padding], dim=-1))
+
+        return torch.stack(batched).to(torch.get_default_dtype())
 
     def _get_action(
         self, observation: dict[str, Any], options: dict[str, Any] | None = None
@@ -424,19 +488,45 @@ class Gr00tPolicy(BasePolicy):
         """
         # Step 1: Split batched observation into individual observations
         unbatched_observations = self._unbatch_observation(observation)
-        processed_inputs = []
 
-        # Step 2: Process each observation through the VLA processor
-        states = []
-        for obs in unbatched_observations:
-            vla_step_data = self._to_vla_step_data(obs)
-            states.append(vla_step_data.states)  # dict[str, np.ndarray[np.float32, (T, D)]]
-            messages = [{"type": MessageType.EPISODE_STEP.value, "content": vla_step_data}]
-            processed_inputs.append(self.processor(messages))
+        # Step 2: Process each observation through the VLA processor.
+        # The VLM half of preprocessing depends only on the video frames and the
+        # language instruction, so it can be reused while both are unchanged.
+        # `state` changes every control step and is always recomputed.
+        states = [self._to_vla_step_data(obs).states for obs in unbatched_observations]
 
-        # Step 3: Collate processed inputs into a single batch for model
-        collated_inputs = self.collate_fn(processed_inputs)
-        collated_inputs = _rec_to_dtype(collated_inputs, dtype=torch.bfloat16)
+        prep_cache_hit = False
+        if self.cache_preprocessing:
+            vlm_fingerprint = self._vlm_fingerprint(observation)
+            prep_cache_hit = (
+                self._cached_collated_inputs is not None
+                and vlm_fingerprint == self._cached_vlm_fingerprint
+            )
+
+        if prep_cache_hit:
+            collated_inputs = dict(self._cached_collated_inputs)
+            collated_inputs["inputs"] = dict(collated_inputs["inputs"])
+            collated_inputs["inputs"]["state"] = _rec_to_dtype(
+                self._normalized_state(states), dtype=torch.bfloat16
+            )
+        else:
+            processed_inputs = []
+            for obs in unbatched_observations:
+                messages = [
+                    {
+                        "type": MessageType.EPISODE_STEP.value,
+                        "content": self._to_vla_step_data(obs),
+                    }
+                ]
+                processed_inputs.append(self.processor(messages))
+
+            # Step 3: Collate processed inputs into a single batch for model
+            collated_inputs = self.collate_fn(processed_inputs)
+            collated_inputs = _rec_to_dtype(collated_inputs, dtype=torch.bfloat16)
+
+            if self.cache_preprocessing:
+                self._cached_collated_inputs = collated_inputs
+                self._cached_vlm_fingerprint = vlm_fingerprint
 
         # Step 4: Run model inference to predict actions
         cache_hit = False
@@ -474,6 +564,8 @@ class Gr00tPolicy(BasePolicy):
             key: value.astype(np.float32) for key, value in unnormalized_action.items()
         }
         info = {"backbone_cache_hit": cache_hit} if self.cache_backbone else {}
+        if self.cache_preprocessing:
+            info["preprocessing_cache_hit"] = prep_cache_hit
         return casted_action, info
 
     def check_action(self, action: dict[str, Any]) -> None:
@@ -537,6 +629,8 @@ class Gr00tPolicy(BasePolicy):
         """
         self._cached_backbone_outputs = None
         self._cached_video_fingerprint = None
+        self._cached_collated_inputs = None
+        self._cached_vlm_fingerprint = None
         return {}
 
 
