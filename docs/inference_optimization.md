@@ -24,6 +24,11 @@ and overstates real throughput.
 | TensorRT alone | 81.8 ms | 81.6 | 86.7 | 12.22 | 2.42x |
 | **TensorRT + caches** | **49.1 ms** | 30.0 | 88.7 | **20.37** | **4.04x** |
 
+> **Caveat:** the rows involving caches assume the camera is slower than the
+> policy query rate (here: 10 Hz camera, policy every control step). That does
+> not hold under realistic action chunking — see "Why caching is a dead end".
+> Without caching, the deployable speedup is TensorRT's **2.42x**.
+
 Two results worth noting:
 
 - **TensorRT alone (2.42x) is slower than caching alone (3.00x).** They are
@@ -114,14 +119,18 @@ policy.model.action_head.model.forward = torch.compile(
 104.9 ms -> 22.5 ms. This removes dispatch overhead *and* fuses kernels; the
 result is below the original GPU time, so both mechanisms contribute.
 
-### 3. Backbone + preprocessing caching
+### 3. Backbone + preprocessing caching (NOT recommended — see below)
 
-See `Gr00tPolicy(cache_backbone=True, cache_preprocessing=True)`. On a repeated
+`Gr00tPolicy(cache_backbone=True, cache_preprocessing=True)`. On a repeated
 camera frame both the vision features and the entire VLM preprocessing branch
 are unchanged, so both are reused; only `state` is recomputed (~0.5 ms), since
 it changes every control step.
 
 Preprocessing on a cache hit: 24.7 ms -> 0.5 ms (46x), bit-identical output.
+
+**This is correct code that solves a problem realistic deployments do not
+have.** It is off by default and should stay that way. See
+"Why caching is a dead end" below before enabling it.
 
 ### 4. TensorRT for the backbone
 
@@ -142,6 +151,55 @@ Backbone 54.1 -> 28.5 ms; action head -> 17.7 ms.
 ---
 
 ## What does not work
+
+### Why caching is a dead end
+
+The cache only hits when the policy is queried *more often* than the camera
+produces frames:
+
+```
+cache hits  <=>  n_action_steps < (control_rate / camera_rate)
+```
+
+At 30 Hz control with a 10 Hz camera that ratio is 3, so `n_action_steps` must
+be 1 or 2. Anything >= 3 gives a hit rate of exactly zero.
+
+| `n_action_steps` | query interval | cache hit rate |
+|---|---|---|
+| 1 | 33 ms | 2/3 |
+| 2 | 67 ms | ~1/3 |
+| 3 | 100 ms | 0 |
+| 8 (repo default) | 267 ms | 0 |
+
+Published deployment practice puts this out of reach. pi-0 / pi-0.5 style
+systems predict a horizon of H=50 and **execute 16-25 actions** before
+re-inference, at 30-50 Hz control. At an execution horizon of 16, inference
+happens every ~533 ms while the camera refreshes every 100 ms -- five new
+frames per query. The cache can never hit.
+
+Two further problems:
+
+- **Action chunking is a better solution to the same problem.** Both reduce
+  model compute per unit of robot time; chunking does it by querying less
+  often. It is already the default, which is precisely why it leaves nothing
+  for the cache to save. Measured here: 96% success at `n_action_steps=8` vs
+  80% at `n_action_steps=1` on the same task and seed.
+- **Caching pairs fresh proprioceptive state with stale vision**, which the
+  model never saw in training. Chunking keeps the whole chunk consistent with
+  one observation. Closed-loop LIBERO, holding vision for 24 control steps:
+  **0/50 success vs 48/50 baseline**. At ~100 ms staleness the drop was 12
+  points (68% vs 80%), not significant at n=25 (Fisher p=0.52) but not
+  excluded either.
+
+**Conclusion:** keep the code, keep it off by default. The latency win it was
+built for is better obtained from action chunking (free, and more accurate),
+and from TensorRT / CUDA graphs, which apply to every inference regardless of
+horizon.
+
+Note that inference latency still matters under chunking -- real-time chunking
+(RTC) degrades as latency grows, and is evaluated with +100/+200 ms injected
+latency. So the TensorRT and CUDA-graph work retains its value; only the
+caching does not.
 
 ### torch.compile on the VLM backbone
 
