@@ -305,3 +305,29 @@ perturbation is well below the motion the task itself commands each step.
 Per-tensor cosine similarity is a weak gate: this TRT build verifies at
 cosine 0.999961 overall while `gripper_position` sits at 0.94. Judge with
 closed-loop success rate, not cosine.
+
+### Closed-loop result: TensorRT drift does not cost task success
+
+LIBERO `KITCHEN_SCENE3_turn_on_the_stove_and_put_the_moka_pot_on_it`,
+208 episodes per arm, `n_action_steps=1`, `n_envs=8`, identical seeds --
+the two arms differ only in PyTorch vs TensorRT:
+
+| arm | success | 95% CI |
+|---|---|---|
+| PyTorch baseline | 168/208 = 80.8% | [74.9, 85.5] |
+| TensorRT full pipeline | 174/209 = 83.3% | [77.6, 87.7] |
+
+```
+difference (TRT - PyTorch) = +2.5 points
+95% CI on difference       = [-4.9, +9.9]
+Fisher exact two-sided p   = 0.526
+```
+
+No degradation; the point estimate slightly favours TRT. At this sample size a
+regression worse than ~4.9 points is excluded at 95% confidence.
+
+Note how little the per-tensor diagnostics predicted: max action drift
+2.25e-01 and `gripper_position` cosine 0.940 looked alarming and meant
+nothing for task outcome. Sample size matters too -- an earlier n=25
+comparison could not distinguish 80% from 68% (Fisher p=0.52). Detecting a
+12-point effect needs ~209 episodes per arm.
