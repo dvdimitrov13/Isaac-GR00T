@@ -182,9 +182,33 @@ Both are *exact* attention implementations, so the difference is floating-point
 accumulation order, not a modelling change — the same class of numerical
 difference as a TensorRT engine.
 
-> A drift figure alone does not establish that behaviour is unchanged. Relative
-> error is misleading when a key's range is small. The appropriate standard is
-> closed-loop task success, as used to validate the TensorRT path.
+A drift figure alone does not establish that behaviour is unchanged — relative
+error is misleading when a key's range is small. So the attention-backend change
+was validated the same way the TensorRT path was: closed-loop task success.
+
+### Closed-loop validation
+
+LIBERO `libero_10`, all 10 tasks, 21 episodes each, matched seeds, `n_envs=1`.
+
+| arm | successes | rate | 95% CI |
+|---|---|---|---|
+| eager, flash-attention-2 | 180/210 | 85.7% | [80.3, 89.8] |
+| sdpa + CUDA graph | 186/210 | 88.6% | [83.6, 92.2] |
+
+**Fisher exact two-sided p = 0.466** — no significant difference. The +2.9 point
+delta is within noise and favours the optimised path, so there is no sign of
+systematic degradation. The 95% interval on the difference is about
+[-3.5, +9.3] points, excluding any regression larger than roughly 3.5 points.
+
+> **This evaluation earned its keep immediately.** The first run scored the graph
+> arm at 0/10 against an eager 9/10, with a device-side out-of-bounds gather.
+> Two real bugs — a static input buffer that was never refreshed because
+> `state` collided between the two input dicts, and a memoised
+> `_preprocess_mask_arguments` caching per-call tensors. Neither was visible to a
+> single-step comparison, because **replaying one observation cannot distinguish
+> a correct graph from one that ignores its inputs entirely.** Verify with a
+> sequence of differing observations, and run closed loop before believing a
+> latency win.
 
 ### Verifying it yourself
 
