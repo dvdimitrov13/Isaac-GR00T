@@ -20,6 +20,7 @@ This module provides the core policy classes for running Gr00t models:
 - Gr00tSimPolicyWrapper: Wrapper for compatibility with existing Gr00t simulation environments
 """
 
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +33,9 @@ from gr00t.data.interfaces import BaseProcessor
 from gr00t.data.types import MessageType, ModalityConfig, VLAStepData
 
 from .policy import BasePolicy, PolicyWrapper
+
+
+logger = logging.getLogger(__name__)
 
 
 def _rec_to_dtype(x: Any, dtype: torch.dtype) -> Any:
@@ -87,6 +91,7 @@ class Gr00tPolicy(BasePolicy):
         *,
         device: int | str,
         strict: bool = True,
+        use_cuda_graph: bool = False,
     ):
         """Initialize the Gr00t Policy.
 
@@ -96,9 +101,24 @@ class Gr00tPolicy(BasePolicy):
             model_path: Path to the pretrained model checkpoint directory
             device: Device to run the model on (e.g., 'cuda:0', 0, 'cpu')
             strict: Whether to enforce strict input validation (default: True)
+            use_cuda_graph: Capture the model forward into a CUDA graph and replay
+                it each control step (default: False). At batch 1 the forward is
+                dispatch-bound -- roughly two thirds of its wall time is the GPU
+                idle between kernel launches -- and replay removes that overhead
+                while executing the identical kernels, so actions are unchanged
+                (measured on RTX 5090: 90.5 ms -> 32.3 ms, actions bit-identical to
+                eager sdpa execution; see docs/cuda_graph_capture.md).
+
+                Requires a fixed camera configuration and prompt length; if the
+                input signature changes, execution falls back to eager.
         """
         # Import this to register all models.
         import gr00t.model  # noqa: F401
+
+        # Imported here rather than at module scope: gr00t.model pulls in the
+        # model registry, and importing it eagerly would make gr00t.policy and
+        # gr00t.model import each other at load time.
+        from gr00t.model.graph_capture import ModelGraphRunner, is_capture_supported
 
         super().__init__(strict=strict)
         if isinstance(embodiment_tag, str):
@@ -110,6 +130,13 @@ class Gr00tPolicy(BasePolicy):
         model.eval()  # Set model to evaluation mode
         model.to(device=device, dtype=torch.bfloat16)
         self.model = model
+
+        # Capture is lazy: the runner records the graph on the first get_action,
+        # once real inputs are available to size the static buffers.
+        self._graph_runner = ModelGraphRunner(model) if use_cuda_graph else None
+        if use_cuda_graph and not is_capture_supported():
+            logger.warning("use_cuda_graph requested but CUDA is unavailable; ignoring.")
+            self._graph_runner = None
 
         # Load the processor for input/output transformation.
         # Training saves processor files under a "processor/" subdirectory, but
@@ -413,8 +440,13 @@ class Gr00tPolicy(BasePolicy):
         collated_inputs = _rec_to_dtype(collated_inputs, dtype=torch.bfloat16)
 
         # Step 4: Run model inference to predict actions
-        with torch.inference_mode():
-            model_pred = self.model.get_action(**collated_inputs)
+        if self._graph_runner is not None:
+            # collator wraps the batch as {"inputs": ...}; the runner needs the
+            # batch itself so it can size static buffers from its tensors
+            model_pred = self._graph_runner(collated_inputs["inputs"])
+        else:
+            with torch.inference_mode():
+                model_pred = self.model.get_action(**collated_inputs)
         normalized_action = model_pred["action_pred"].float()
 
         # Step 5: Decode actions from normalized space back to physical units

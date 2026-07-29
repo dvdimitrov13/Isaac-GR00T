@@ -418,6 +418,33 @@ For connecting to a real robot (e.g., DROID hardware), see [examples/DROID/READM
 
 See the complete [Policy API Guide](getting_started/policy.md) for documentation on observation/action formats, batched inference, and troubleshooting.
 
+### CUDA Graph Capture (2.8x lower latency)
+
+At batch 1 the model forward is dispatch-bound rather than compute-bound: about
+**72% of its wall time is the GPU sitting idle** between roughly 5,500 kernel
+launches. Capturing the forward into a CUDA graph and replaying it removes that
+overhead:
+
+```python
+policy = Gr00tPolicy(
+    model_path="...",
+    embodiment_tag="LIBERO_PANDA",
+    device="cuda",
+    use_cuda_graph=True,
+)
+```
+
+On an RTX 5090 with the LIBERO checkpoint this takes the model forward from
+**90.5 ms to 32.3 ms (2.80x)** — 11.1 Hz to 31.0 Hz — with **bit-identical**
+actions (`0.000e+00` on every action key versus eager execution).
+
+Requires a fixed camera configuration and prompt length; if the input signature
+changes, execution automatically falls back to eager. See the
+[CUDA Graph Capture Guide](docs/cuda_graph_capture.md) for the measurements, the
+seven host synchronisations in the vision-language backbone that had to be
+removed to make capture possible, and the numerical caveat around the attention
+backend.
+
 ---
 
 ## Fine-tuning
