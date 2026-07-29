@@ -297,24 +297,46 @@ class CaptureCompatPatcher:
         """Sync 6 -- ``padding_mask.all()`` in the attention-mask fast path.
 
         ``_ignore_causal_mask_sdpa`` asks whether the padding mask is entirely
-        ones, so it can skip building an explicit causal mask. For a fixed
-        prompt shape the answer never changes, so it is asked once and reused.
+        ones so it can skip building an explicit causal mask. It returns a plain
+        bool, and for a fixed prompt shape the answer never changes, so it is
+        answered once on the host and reused.
+
+        Two things this deliberately does NOT do, both of which caused a
+        catastrophic closed-loop failure (0/10 vs 90/100 success) when they were
+        attempted:
+
+        * It does not memoise ``_preprocess_mask_arguments``. That function
+          consumes the live attention mask and cache position and returns
+          tensors derived from them -- per-call values, not geometry. Caching it
+          hands back stale tensors and produced out-of-bounds index kernels.
+        * The patch is keyed to this backbone instance. ``masking_utils`` is a
+          module shared by every model in the process, so patching it
+          unconditionally leaked the cache into unrelated policies, including an
+          eager baseline being measured alongside.
         """
         import transformers.masking_utils as masking_utils
 
-        for name in ("_ignore_causal_mask_sdpa", "_preprocess_mask_arguments"):
-            if not hasattr(masking_utils, name):
-                continue
-            original = getattr(masking_utils, name)
-            cache: dict[str, Any] = {}
+        name = "_ignore_causal_mask_sdpa"
+        if not hasattr(masking_utils, name):
+            return
+        original = getattr(masking_utils, name)
+        cache: dict[str, Any] = {}
+        # only bypass the device read while THIS patcher is active
+        active = self
 
-            def memoised(*args, _original=original, _cache=cache, **kwargs):
-                if "value" not in _cache:
-                    _cache["value"] = _original(*args, **kwargs)
-                return _cache["value"]
+        def memoised(*args, **kwargs):
+            if not active._applied:
+                return original(*args, **kwargs)
+            if "value" not in cache:
+                result = original(*args, **kwargs)
+                if not isinstance(result, bool):
+                    # not the plain bool we reasoned about -- do not cache it
+                    return result
+                cache["value"] = result
+            return cache["value"]
 
-            setattr(masking_utils, name, memoised)
-            self._undo.append(lambda n=name, o=original: setattr(masking_utils, n, o))
+        setattr(masking_utils, name, memoised)
+        self._undo.append(lambda: setattr(masking_utils, name, original))
 
     def _patch_deepstack(self) -> None:
         """Sync 7 -- a boolean-mask gather in the deepstack visual merge.
@@ -347,6 +369,21 @@ class CaptureCompatPatcher:
 
         owner._deepstack_process = deepstack_static
         self._undo.append(lambda: setattr(owner, "_deepstack_process", original))
+
+
+def _namespaced(backbone_inputs: Any, action_inputs: Any) -> dict[str, Any]:
+    """Merge the two input dicts under distinct keys.
+
+    ``state`` and ``embodiment_id`` appear in both the backbone and action-head
+    inputs. A plain merge silently drops one of each, which is how a static
+    buffer can end up frozen at its capture-time contents while every check
+    still passes.
+    """
+    merged: dict[str, Any] = {}
+    for prefix, holder in (("backbone", backbone_inputs), ("action", action_inputs)):
+        for key, value in dict(holder).items():
+            merged[f"{prefix}.{key}"] = value
+    return merged
 
 
 def _signature(inputs: dict[str, Any]) -> tuple:
@@ -403,7 +440,9 @@ class ModelGraphRunner:
             backbone_inputs, action_inputs = self.model.prepare_input(inputs)
         backbone_inputs = host_side_geometry(backbone_inputs)
 
-        signature = _signature({**dict(backbone_inputs), **dict(action_inputs)})
+        # Namespace the two dicts: `state` and `embodiment_id` appear in BOTH,
+        # so merging them loses one and would let a stale buffer go unnoticed.
+        signature = _signature(_namespaced(backbone_inputs, action_inputs))
         if self._graph is None:
             try:
                 self._capture(backbone_inputs, action_inputs, signature, options)
@@ -428,7 +467,7 @@ class ModelGraphRunner:
                 return self.model.get_action(inputs, options)
 
         assert self._static_inputs is not None and self._static_output is not None
-        live = {**dict(backbone_inputs), **dict(action_inputs)}
+        live = _namespaced(backbone_inputs, action_inputs)
         for key, buffer in self._static_inputs.items():
             buffer.copy_(live[key])
         self._graph.replay()
@@ -451,12 +490,15 @@ class ModelGraphRunner:
         static_inputs: dict[str, torch.Tensor] = {}
         bb_static = dict(backbone_inputs)
         ah_static = dict(action_inputs)
-        for holder in (bb_static, ah_static):
+        for prefix, holder in (("backbone", bb_static), ("action", ah_static)):
             for key, value in holder.items():
                 if torch.is_tensor(value) and value.device.type == "cuda":
                     buffer = value.clone()
                     holder[key] = buffer
-                    static_inputs[key] = buffer
+                    # namespaced: `state` and `embodiment_id` live in both dicts,
+                    # and an unprefixed key would let one shadow the other,
+                    # leaving the shadowed buffer frozen at capture-time values
+                    static_inputs[f"{prefix}.{key}"] = buffer
         bb_batch = BatchFeature(data=bb_static)
         ah_batch = BatchFeature(data=ah_static)
 

@@ -17,6 +17,7 @@
 
 from gr00t.model.graph_capture import (
     ModelGraphRunner,
+    _namespaced,
     _signature,
     host_side_geometry,
     is_capture_supported,
@@ -37,6 +38,26 @@ def test_host_side_geometry_moves_only_grid_tensors():
     # values must survive the move untouched
     assert torch.equal(out["image_grid_thw"], inputs["image_grid_thw"].cpu())
     assert out["input_ids"].device == inputs["input_ids"].device
+
+
+def test_namespacing_keeps_colliding_keys_apart():
+    """`state` and `embodiment_id` appear in BOTH the backbone and action-head
+    inputs. A plain merge drops one of each, which previously left a static
+    buffer frozen at its capture-time contents -- the model then emitted a
+    constant action and closed-loop success collapsed to 0%."""
+    backbone = {"state": torch.zeros(1, 4), "pixel_values": torch.zeros(8, 16)}
+    action = {"state": torch.ones(1, 4), "embodiment_id": torch.zeros(1)}
+    merged = _namespaced(backbone, action)
+
+    assert set(merged) == {
+        "backbone.state",
+        "backbone.pixel_values",
+        "action.state",
+        "action.embodiment_id",
+    }
+    # the two `state` tensors must survive as distinct entries
+    assert torch.equal(merged["backbone.state"], torch.zeros(1, 4))
+    assert torch.equal(merged["action.state"], torch.ones(1, 4))
 
 
 def test_signature_distinguishes_shape_and_dtype():
