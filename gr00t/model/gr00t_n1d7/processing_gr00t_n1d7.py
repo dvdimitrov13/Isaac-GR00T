@@ -474,8 +474,10 @@ class Gr00tN1d7Processor(BaseProcessor):
                 [torch.from_numpy(norm_state_dict[key]) for key in state_keys], dim=-1
             )
 
-        assert normalized_states.shape[1] <= self.max_state_dim, (
-            f"State dimension {normalized_states.shape[1]} exceeds max_state_dim {self.max_state_dim}"
+        # Batched states are (B, T, D): axis 1 is the state history length, so the state
+        # dimension is the last axis -- the same one the padding below is computed from.
+        assert normalized_states.shape[-1] <= self.max_state_dim, (
+            f"State dimension {normalized_states.shape[-1]} exceeds max_state_dim {self.max_state_dim}"
         )
         padding_shape = (
             *normalized_states.shape[:-1],
